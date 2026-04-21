@@ -1,84 +1,265 @@
 import streamlit as st
-import yfinance as yf
 import pandas as pd
+import time
+from scanner import scan_breakouts
 
-st.set_page_config(page_title="Breakout Debug", layout="wide")
-st.title("🔍 Breakout Scanner — Debug Mode")
+st.set_page_config(
+    page_title="Nifty 500 Breakout Scanner",
+    page_icon="🔥",
+    layout="wide",
+    initial_sidebar_state="collapsed",
+)
 
-# Test with just 10 well-known stocks first
-TEST_STOCKS = [
-    "RELIANCE.NS", "TCS.NS", "HDFCBANK.NS", "INFY.NS", "ICICIBANK.NS",
-    "LT.NS", "SBIN.NS", "BHARTIARTL.NS", "ITC.NS", "KOTAKBANK.NS"
-]
-
-st.markdown("Testing 10 stocks with **relaxed conditions** to verify data is flowing correctly.")
-st.markdown("---")
-
-rows = []
-progress = st.progress(0)
-status = st.empty()
-
-for i, ticker in enumerate(TEST_STOCKS):
-    progress.progress((i + 1) / len(TEST_STOCKS))
-    status.text(f"Fetching {ticker}...")
-
-    try:
-        df = yf.download(ticker, period="3mo", interval="1d", progress=False, auto_adjust=True)
-
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-
-        if df.empty or len(df) < 21:
-            rows.append({"Ticker": ticker, "C > 20H": "no data", "V > 1.5x": "no data", "C > 20DMA": "no data"})
-            continue
-
-        df["20DMA"]    = df["Close"].rolling(20).mean()
-        df["10VolAvg"] = df["Volume"].rolling(10).mean()
-        df["20High"]   = df["High"].rolling(20).max()
-
-        latest = df.iloc[-1]
-        close  = float(latest["Close"])
-        high20 = float(latest["20High"])
-        vol    = float(latest["Volume"])
-        volavg = float(latest["10VolAvg"])
-        dma20  = float(latest["20DMA"])
-
-        c1 = close > high20
-        c2 = vol > 1.5 * volavg
-        c3 = close > dma20
-
-        rows.append({
-            "Ticker":          ticker.replace(".NS", ""),
-            "Close ₹":         round(close, 1),
-            "20D High ₹":      round(high20, 1),
-            "Vol Ratio":       round(vol / volavg, 2),
-            "20D MA ₹":        round(dma20, 1),
-            "C > 20H":         "✅" if c1 else "❌",
-            "V > 1.5×avg":     "✅" if c2 else "❌",
-            "C > 20DMA":       "✅" if c3 else "❌",
-            "Strict (all 3)":  "🔥" if (c1 and c2 and c3) else "—",
-            "Relaxed (any 1)": "⚡" if (c1 or c2 or c3) else "—",
-        })
-
-    except Exception as e:
-        rows.append({"Ticker": ticker, "Error": str(e)})
-
-progress.empty()
-status.empty()
-
-st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-
-st.markdown("---")
 st.markdown("""
-**How to read this:**
-- `C > 20H` — Close broke above 20-day rolling high
-- `V > 1.5×avg` — Volume surge (50%+ above 10-day avg)
-- `C > 20DMA` — Close above 20-day moving average (uptrend)
-- **Strict** = all 3 true → original scanner logic
-- **Relaxed** = any 1 true → you should see several stocks here
+<style>
+.main-title { font-size: 2rem; font-weight: 700; letter-spacing: -0.5px; margin-bottom: 0; }
+.subtitle { color: #888; font-size: 0.95rem; margin-top: 0.2rem; }
+.stProgress > div > div > div { background-color: #fd7e14; }
+div[data-testid="stDataFrame"] { border-radius: 10px; overflow: hidden; }
+</style>
+""", unsafe_allow_html=True)
 
-If **Relaxed** is also all `—`, the data pipeline has a problem. Share a screenshot and I'll fix it.
-""")
+REFRESH_INTERVAL = 30 * 60  # 30 minutes
+
+# ── Header ────────────────────────────────────────────────────────────────────
+col_title, col_btn = st.columns([3, 1])
+with col_title:
+    st.markdown('<p class="main-title">🔥 Nifty 500 Breakout Scanner</p>', unsafe_allow_html=True)
+    st.markdown('<p class="subtitle">Triple-confirmed breakouts: Price × Volume × Trend · Auto-refreshes every 30 min</p>', unsafe_allow_html=True)
+with col_btn:
+    st.markdown("<br>", unsafe_allow_html=True)
+    manual_refresh = st.button("↻ Refresh Now", use_container_width=True, type="primary")
+
+# ── Session state ─────────────────────────────────────────────────────────────
+if "last_scan_time"   not in st.session_state: st.session_state.last_scan_time   = 0
+if "results"          not in st.session_state: st.session_state.results          = None
+if "errors"           not in st.session_state: st.session_state.errors           = []
+if "scan_timestamp"   not in st.session_state: st.session_state.scan_timestamp   = None
+if "market_snapshot"  not in st.session_state: st.session_state.market_snapshot  = {}
+
+now = time.time()
+needs_refresh = (
+    st.session_state.results is None
+    or (now - st.session_state.last_scan_time) >= REFRESH_INTERVAL
+    or manual_refresh
+)
+
+# ── Scan ──────────────────────────────────────────────────────────────────────
+if needs_refresh:
+    st.markdown("---")
+    st.markdown("**Scanning all 500 stocks...** Takes ~3 minutes. Grab a chai ☕")
+    bar = st.progress(0)
+    status = st.empty()
+
+    def on_progress(cur, total, ticker):
+        bar.progress(cur / total)
+        status.markdown(f"⏳ `{ticker}` &nbsp;—&nbsp; {cur}/{total} &nbsp;({int(cur/total*100)}%)")
+
+    results, errors, ts = scan_breakouts(progress_callback=on_progress)
+
+    # Save a quick market snapshot (% stocks above 20DMA) for context
+    bar.empty(); status.empty()
+
+    st.session_state.results         = results
+    st.session_state.errors          = errors
+    st.session_state.last_scan_time  = time.time()
+    st.session_state.scan_timestamp  = ts
+
+# ── Display ───────────────────────────────────────────────────────────────────
+results = st.session_state.results
+scan_ts = st.session_state.scan_timestamp
+
+if results is not None:
+    st.markdown("---")
+
+    time_since = time.time() - st.session_state.last_scan_time
+    next_min   = max(0, int((REFRESH_INTERVAL - time_since) / 60))
+    ts_str     = scan_ts.strftime("%d %b %Y, %I:%M %p") if scan_ts else "—"
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("🔥 Breakouts Found", len(results))
+    m2.metric("📊 Universe", "Nifty 500")
+    m3.metric("⏱ Next Refresh", f"{next_min} min")
+    m4.metric("🕐 Last Scanned", ts_str)
+
+    st.markdown("---")
+
+    if len(results) == 0:
+        st.info("""
+**No breakouts right now — and that's a valid signal.**
+
+Based on the last scan, all 500 stocks are either:
+- Trading **below** their 20-day highs (market in pullback), or
+- Showing **below-average volume** (no institutional conviction), or both
+
+This is completely normal during consolidation phases. The scanner will catch the next move when it comes.
+        """)
+        st.markdown("**What to expect:** On an active trending day, you'll typically see 5–30 breakouts across Nifty 500. On a strong breakout day (like a broad rally), you might see 50+.")
+
+    else:
+        st.markdown(f"### {len(results)} Breakout Stock{'s' if len(results) != 1 else ''}")
+        st.caption("Sorted by Volume Ratio — strongest institutional conviction first. All 3 conditions confirmed: Close > 20D High | Volume > 1.5× avg | Close > 20D MA")
+
+        df_display = pd.DataFrame(results).drop(columns=["_ticker_full"])
+
+        def style_df(df):
+            styled = df.style.format({
+                "Close (₹)":        "₹{:.2f}",
+                "20D High (₹)":     "₹{:.2f}",
+                "20D MA (₹)":       "₹{:.2f}",
+                "% Above 20D High": "{:+.2f}%",
+                "Day Change (%)":   "{:+.2f}%",
+                "Volume Ratio":     "{:.2f}×",
+            })
+            styled = styled.applymap(
+                lambda v: "color: #198754; font-weight:600" if v > 0 else "color: #dc3545; font-weight:600",
+                subset=["Day Change (%)", "% Above 20D High"]
+            )
+            styled = styled.applymap(
+                lambda v: "color: #fd7e14; font-weight:600",
+                subset=["Volume Ratio"]
+            )
+            return styled
+
+        st.dataframe(
+            style_df(df_display),
+            use_container_width=True,
+            hide_index=True,
+            height=min(600, 50 + len(df_display) * 38),
+        )
+
+        csv = df_display.to_csv(index=False)
+        st.download_button(
+            label="⬇ Download CSV",
+            data=csv,
+            file_name=f"breakouts_{scan_ts.strftime('%Y%m%d_%H%M') if scan_ts else 'today'}.csv",
+            mime="text/csv",
+        )
+
+    # ── Errors ──
+    if st.session_state.errors:
+        with st.expander(f"⚠️ {len(st.session_state.errors)} tickers skipped"):
+            for e in st.session_state.errors[:20]:
+                st.caption(f"`{e['ticker']}` — {e['error']}")
+
+# ── Methodology ───────────────────────────────────────────────────────────────
+with st.expander("📖 How the breakout logic works"):
+    st.markdown("""
+**All 3 conditions must be true simultaneously:**
+
+| Condition | What it checks | Why it matters |
+|---|---|---|
+| `Close > 20-Day High` | Price broke above 20-day rolling resistance | The actual breakout |
+| `Volume > 1.5× 10-Day Avg` | Unusual buying surge vs recent baseline | Confirms real demand, not a fake-out |
+| `Close > 20-Day MA` | Stock is in an uptrend | Filters stocks in downtrends |
+
+**Sorted by Volume Ratio** — a 3× volume breakout is stronger than a 1.6× one.
+
+**Data:** Yahoo Finance (NSE daily OHLCV), 3-month lookback, auto-refreshes every 30 minutes.
+    """)
+
+# ── Auto-rerun ────────────────────────────────────────────────────────────────
+if st.session_state.results is not None:
+    elapsed   = time.time() - st.session_state.last_scan_time
+    remaining = REFRESH_INTERVAL - elapsed
+    if remaining > 0:
+        mins = int(remaining // 60)
+        secs = int(remaining % 60)
+        st.caption(f"🔄 Auto-refreshing in {mins}m {secs}s")
+        time.sleep(min(remaining, 60))
+        st.rerun()
+
+
+
+
+
+
+
+
+
+
+
+# import streamlit as st
+# import yfinance as yf
+# import pandas as pd
+
+# st.set_page_config(page_title="Breakout Debug", layout="wide")
+# st.title("🔍 Breakout Scanner — Debug Mode")
+
+# # Test with just 10 well-known stocks first
+# TEST_STOCKS = [
+#     "RELIANCE.NS", "TCS.NS", "HDFCBANK.NS", "INFY.NS", "ICICIBANK.NS",
+#     "LT.NS", "SBIN.NS", "BHARTIARTL.NS", "ITC.NS", "KOTAKBANK.NS"
+# ]
+
+# st.markdown("Testing 10 stocks with **relaxed conditions** to verify data is flowing correctly.")
+# st.markdown("---")
+
+# rows = []
+# progress = st.progress(0)
+# status = st.empty()
+
+# for i, ticker in enumerate(TEST_STOCKS):
+#     progress.progress((i + 1) / len(TEST_STOCKS))
+#     status.text(f"Fetching {ticker}...")
+
+#     try:
+#         df = yf.download(ticker, period="3mo", interval="1d", progress=False, auto_adjust=True)
+
+#         if isinstance(df.columns, pd.MultiIndex):
+#             df.columns = df.columns.get_level_values(0)
+
+#         if df.empty or len(df) < 21:
+#             rows.append({"Ticker": ticker, "C > 20H": "no data", "V > 1.5x": "no data", "C > 20DMA": "no data"})
+#             continue
+
+#         df["20DMA"]    = df["Close"].rolling(20).mean()
+#         df["10VolAvg"] = df["Volume"].rolling(10).mean()
+#         df["20High"]   = df["High"].rolling(20).max()
+
+#         latest = df.iloc[-1]
+#         close  = float(latest["Close"])
+#         high20 = float(latest["20High"])
+#         vol    = float(latest["Volume"])
+#         volavg = float(latest["10VolAvg"])
+#         dma20  = float(latest["20DMA"])
+
+#         c1 = close > high20
+#         c2 = vol > 1.5 * volavg
+#         c3 = close > dma20
+
+#         rows.append({
+#             "Ticker":          ticker.replace(".NS", ""),
+#             "Close ₹":         round(close, 1),
+#             "20D High ₹":      round(high20, 1),
+#             "Vol Ratio":       round(vol / volavg, 2),
+#             "20D MA ₹":        round(dma20, 1),
+#             "C > 20H":         "✅" if c1 else "❌",
+#             "V > 1.5×avg":     "✅" if c2 else "❌",
+#             "C > 20DMA":       "✅" if c3 else "❌",
+#             "Strict (all 3)":  "🔥" if (c1 and c2 and c3) else "—",
+#             "Relaxed (any 1)": "⚡" if (c1 or c2 or c3) else "—",
+#         })
+
+#     except Exception as e:
+#         rows.append({"Ticker": ticker, "Error": str(e)})
+
+# progress.empty()
+# status.empty()
+
+# st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+# st.markdown("---")
+# st.markdown("""
+# **How to read this:**
+# - `C > 20H` — Close broke above 20-day rolling high
+# - `V > 1.5×avg` — Volume surge (50%+ above 10-day avg)
+# - `C > 20DMA` — Close above 20-day moving average (uptrend)
+# - **Strict** = all 3 true → original scanner logic
+# - **Relaxed** = any 1 true → you should see several stocks here
+
+# If **Relaxed** is also all `—`, the data pipeline has a problem. Share a screenshot and I'll fix it.
+# """)
 
 
 
